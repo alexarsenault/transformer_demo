@@ -179,6 +179,30 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.tensor) -> torch.tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[: x.size(0)]
+        return self.dropout(x)
+
+
 class CTransformer(nn.Module):
     """
     Transformer for classifying sequences
@@ -210,10 +234,9 @@ class CTransformer(nn.Module):
         super().__init__()
 
         self.num_tokens, self.max_pool = num_tokens, max_pool
-        self.token_embedding = nn.Embedding(
-            embedding_dim=emb, num_embeddings=num_tokens
-        )
-        self.pos_embedding = nn.Embedding(embedding_dim=emb, num_embeddings=seq_length)
+        self.value_embedding = nn.Linear(1, emb, dtype=torch.double)
+        # self.pos_embedding = nn.Embedding(embedding_dim=emb, num_embeddings=seq_length)
+        self.pos_encoding = PositionalEncoding(emb, max_len=seq_length)
         tblocks = []
         for i in range(depth):
             tblocks.append(
@@ -236,21 +259,14 @@ class CTransformer(nn.Module):
         :param x: A batch by sequence length integer tensor of token indices.
         :return: predicted log-probability vectors for each token based on the preceding tokens.
         """
-        tokens = self.token_embedding(x)
-        b, t, e = tokens.size()
-        positions = self.pos_embedding(torch.arange(t, device="cuda"))[
-            None, :, :
-        ].expand(b, t, e)
-        x = tokens + positions
-        x = self.do(x)
+        x = self.value_embedding(x)
+        x = self.pos_encoding(x)
+        x = x.to(dtype=torch.float)
         x = self.tblocks(x)
-
         x = (
             x.max(dim=1)[0] if self.max_pool else x.mean(dim=1)
         )  # pool over the time dimension
-
         x = self.toprobs(x)
-
         return F.log_softmax(x, dim=1)
 
 
@@ -264,33 +280,16 @@ def main(arg):
         depth=arg.depth,
         seq_length=arg.max_length,
         num_tokens=arg.vocab_size,
-        num_classes=2,
+        num_classes=4,
         max_pool=arg.max_pool,
     )
     model = model.to("cuda")
-    train_iter = IMDB(split="train")
-    test_iter = IMDB(split="test")
 
-    def tokenize(label, line):
-        return line.split()
+    from tslearn.datasets import CachedDatasets
 
-    tokens = []
-    num_samples = 0
-    for label, line in train_iter:
-        tokens += tokenize(label, line)
-        num_samples += 1
-
-    for label, line in test_iter:
-        tokens += tokenize(label, line)
-
-    from collections import Counter
-
-    counter = Counter(tokens)
-    vocab = sorted(counter, key=counter.get, reverse=True)
-    int2word = dict(enumerate(vocab, 1))
-    int2word[0] = "<PAD>"
-    word2int = {word: id for id, word in int2word.items()}
-
+    X_train, y_train, X_test, y_test = CachedDatasets().load_dataset("Trace")
+    num_x_samples = len(X_train)
+    num_y_samples = len(y_train)
     tbw = SummaryWriter(log_dir=arg.tb_dir)  # Tensorboard logging
 
     if torch.cuda.is_available():
@@ -301,8 +300,6 @@ def main(arg):
         opt, lambda i: min(i / (arg.lr_warmup / arg.batch_size), 1.0)
     )
 
-    shuffler = torchdata.datapipes.iter.Shuffler(train_iter, buffer_size=25000)
-
     # training loop
     seen = 0
     for e in range(arg.num_epochs):
@@ -311,33 +308,20 @@ def main(arg):
         model.train(True)
 
         with tqdm.tqdm(
-            total=num_samples // arg.batch_size, smoothing=0.0, position=0, leave=True
+            total=num_x_samples, smoothing=0.0, position=0, leave=True
         ) as pbar:
-            for batch in shuffler.batch(batch_size=arg.batch_size):
+            for x_samp, label in zip(X_train, y_train):
                 opt.zero_grad()
-                tokenized_sequences = [
-                    torch.tensor(
-                        [word2int[token] for token in tokenize(sample[0], sample[1])],
-                        dtype=torch.int64,
-                    )
-                    for sample in batch
-                ]
-                input = pad_sequence(tokenized_sequences, batch_first=True)
-                label = torch.tensor(
-                    [sample[0] - 1 for sample in batch], dtype=torch.int64
+
+                x_samp = (
+                    torch.tensor(x_samp).to("cuda").squeeze().unsqueeze(0).unsqueeze(-1)
                 )
+                label = torch.tensor(label - 1).to("cuda").unsqueeze(0)
 
-                if input.shape[1] > arg.max_length:
-                    input = input[:, : arg.max_length]
-
-                input = input.to("cuda")
-                label = label.to("cuda")
-
-                out = model(input)
+                out = model(x_samp)
                 loss = F.nll_loss(out, label)
 
                 loss.backward()
-                # print(f"Loss: {loss}")
 
                 # clip gradients
                 # - If the total gradient vector has a length > 1, we clip it back down to 1.
@@ -347,7 +331,7 @@ def main(arg):
                 opt.step()
                 sch.step()
 
-                seen += input.size(0)
+                seen += x_samp.shape[0]
                 tbw.add_scalar("classification/train-loss", float(loss.item()), seen)
                 pbar.update(1)
 
@@ -356,33 +340,25 @@ def main(arg):
             model.train(False)
             tot, cor = 0.0, 0.0
 
-            for batch in test_iter.batch(batch_size=arg.batch_size):
+            for x_samp, label in zip(X_test, y_test):
 
-                tokenized_sequences = [
-                    torch.tensor(
-                        [word2int[token] for token in tokenize(sample[0], sample[1])],
-                        dtype=torch.int64,
-                    )
-                    for sample in batch
-                ]
-                input = pad_sequence(tokenized_sequences, batch_first=True)
-                label = torch.tensor(
-                    [sample[0] - 1 for sample in batch], dtype=torch.int64
+                x_samp = (
+                    torch.tensor(x_samp).to("cuda").squeeze().unsqueeze(0).unsqueeze(-1)
                 )
+                label = torch.tensor(label - 1).to("cuda").unsqueeze(0)
 
-                input = input.to("cuda")
-                label = label.to("cuda")
+                out = model(x_samp)
+                pred = out.argmax(dim=1)
 
-                if input.size(1) > arg.max_length:
-                    input = input[:, : arg.max_length]
-                out = model(input).argmax(dim=1)
+                loss = F.nll_loss(out.to(torch.float32), label.to(torch.int64))
 
-                tot += float(input.size(0))
-                cor += float((label == out).sum().item())
+                tot += float(x_samp.shape[0])
+                cor += float((label == pred).sum().item())
 
             acc = cor / tot
             print(f'-- {"test" if arg.final else "validation"} accuracy {acc:.3}')
             tbw.add_scalar("classification/test-loss", float(loss.item()), e)
+            tbw.add_scalar("classification/test-acc", acc, e)
 
 
 if __name__ == "__main__":
@@ -403,7 +379,7 @@ if __name__ == "__main__":
         "--batch-size",
         dest="batch_size",
         help="The batch size.",
-        default=96,
+        default=4,
         type=int,
     )
 
@@ -462,7 +438,7 @@ if __name__ == "__main__":
         "--max",
         dest="max_length",
         help="Max sequence length. Longer sequences are clipped (-1 for no limit).",
-        default=512,
+        default=275,
         type=int,
     )
 
@@ -480,7 +456,7 @@ if __name__ == "__main__":
         "--depth",
         dest="depth",
         help="Depth of the network (nr. of self-attention layers)",
-        default=8,
+        default=4,
         type=int,
     )
 
