@@ -12,6 +12,10 @@ from torch.nn.utils.rnn import pad_sequence
 import torchdata
 from torchtext.datasets import IMDB
 import random, tqdm, sys, math, gzip
+import sentencepiece as spm
+from collections import Counter
+
+device = "cuda"
 
 
 def mask_(matrices, maskval=0.0, mask_diagonal=True):
@@ -179,6 +183,30 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.tensor) -> torch.tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[: x.size(0)]
+        return self.dropout(x)
+
+
 class CTransformer(nn.Module):
     """
     Transformer for classifying sequences
@@ -211,9 +239,11 @@ class CTransformer(nn.Module):
 
         self.num_tokens, self.max_pool = num_tokens, max_pool
         self.token_embedding = nn.Embedding(
-            embedding_dim=emb, num_embeddings=num_tokens
+            embedding_dim=emb, num_embeddings=num_tokens + 2
         )
         self.pos_embedding = nn.Embedding(embedding_dim=emb, num_embeddings=seq_length)
+        self.pos_encoder = PositionalEncoding(d_model=emb, max_len=seq_length)
+
         tblocks = []
         for i in range(depth):
             tblocks.append(
@@ -236,13 +266,25 @@ class CTransformer(nn.Module):
         :param x: A batch by sequence length integer tensor of token indices.
         :return: predicted log-probability vectors for each token based on the preceding tokens.
         """
-        tokens = self.token_embedding(x)
-        b, t, e = tokens.size()
-        positions = self.pos_embedding(torch.arange(t, device="cuda"))[
-            None, :, :
-        ].expand(b, t, e)
-        x = tokens + positions
-        x = self.do(x)
+
+        # positions = (
+        #     torch.arange(0, x.shape[1])
+        #     .view(1, x.shape[1])
+        #     .repeat(x.shape[0], 1)
+        #     .to(device)
+        # )
+        # pos_encodings = self.pos_embedding(positions)
+        embeddings = self.token_embedding(x)
+        # x = tokens + pos_encodings
+        x = self.pos_encoder(embeddings)
+
+        # b, t, e = tokens.size()
+        # x = self.pos_encoder(tokens)
+        # positions = self.pos_embedding(torch.arange(t, device=device))[
+        #     None, :, :
+        # ].expand(b, t, e)
+        # x = tokens + positions
+        # x = self.do(x)
         x = self.tblocks(x)
 
         x = (
@@ -262,12 +304,13 @@ def main(arg):
         emb=arg.embedding_size,
         heads=arg.num_heads,
         depth=arg.depth,
+        dropout=0.2,
         seq_length=arg.max_length,
         num_tokens=arg.vocab_size,
         num_classes=2,
         max_pool=arg.max_pool,
     )
-    model = model.to("cuda")
+    model = model.to(device)
     train_iter = IMDB(split="train")
     test_iter = IMDB(split="test")
 
@@ -275,26 +318,55 @@ def main(arg):
         return line.split()
 
     tokens = []
+    sentences = []
     num_samples = 0
     for label, line in train_iter:
         tokens += tokenize(label, line)
+        sentences.append(line)
         num_samples += 1
 
     for label, line in test_iter:
         tokens += tokenize(label, line)
+        sentences.append(license)
 
-    from collections import Counter
+    def create_vocabulary(sentences, max_size, tokens):
+        token_counts = Counter(tokens)
+        sorted_tokens = sorted(
+            token_counts.items(), key=lambda item: item[1], reverse=True
+        )
+        if len(sorted_tokens) > max_size - 2:
+            vocabulary = [token for token, _ in sorted_tokens[:max_size]]
+        else:
+            vocabulary = [token for token, _ in sorted_tokens]
+        if "<unk>" not in vocabulary:
+            vocabulary.insert(0, "<unk>")
 
-    counter = Counter(tokens)
-    vocab = sorted(counter, key=counter.get, reverse=True)
-    int2word = dict(enumerate(vocab, 1))
-    int2word[0] = "<PAD>"
-    word2int = {word: id for id, word in int2word.items()}
+        if "<pad>" not in vocabulary:
+            vocabulary.insert(0, "<pad>")
+
+        word2int = {word: idx for idx, word in enumerate(vocabulary)}
+        return vocabulary, word2int
+
+    # Create vocabulary and word-to-index lookup
+    vocabulary, word2int = create_vocabulary(sentences, arg.vocab_size, tokens)
+
+    def paragraph_to_indices(
+        paragraph, word2int, unknown_char="<unk>", padding_char="<pad>", max_length=512
+    ):
+        paragraph_indices = []
+        unk_index = word2int.get(unknown_char, None)
+        pad_index = word2int.get(padding_char, None)
+        paragraph = paragraph.split()
+
+        if len(paragraph) < max_length:
+            padding_length = max_length - len(paragraph)
+            paragraph += [pad_index] * padding_length
+
+        for word in paragraph:
+            paragraph_indices += [word2int[word] if word in word2int else unk_index]
+        return torch.tensor(paragraph_indices, dtype=torch.int64)
 
     tbw = SummaryWriter(log_dir=arg.tb_dir)  # Tensorboard logging
-
-    if torch.cuda.is_available():
-        model.cuda()
 
     opt = torch.optim.Adam(lr=arg.lr, params=model.parameters())
     sch = torch.optim.lr_scheduler.LambdaLR(
@@ -316,11 +388,8 @@ def main(arg):
             for batch in shuffler.batch(batch_size=arg.batch_size):
                 opt.zero_grad()
                 tokenized_sequences = [
-                    torch.tensor(
-                        [word2int[token] for token in tokenize(sample[0], sample[1])],
-                        dtype=torch.int64,
-                    )
-                    for sample in batch
+                    paragraph_to_indices(b[1], word2int, max_length=arg.max_length)
+                    for b in batch
                 ]
                 input = pad_sequence(tokenized_sequences, batch_first=True)
                 label = torch.tensor(
@@ -330,10 +399,16 @@ def main(arg):
                 if input.shape[1] > arg.max_length:
                     input = input[:, : arg.max_length]
 
-                input = input.to("cuda")
-                label = label.to("cuda")
+                input = input.to(device)
+                label = label.to(device)
+
+                # print(f"Input shape: {input}")
+                # print(f"Label shape: {label}")
 
                 out = model(input)
+
+                # print(f"Output shape: {out}")
+
                 loss = F.nll_loss(out, label)
 
                 loss.backward()
@@ -359,19 +434,19 @@ def main(arg):
             for batch in test_iter.batch(batch_size=arg.batch_size):
 
                 tokenized_sequences = [
-                    torch.tensor(
-                        [word2int[token] for token in tokenize(sample[0], sample[1])],
-                        dtype=torch.int64,
-                    )
-                    for sample in batch
+                    paragraph_to_indices(b[1], word2int, max_length=arg.max_length)
+                    for b in batch
                 ]
                 input = pad_sequence(tokenized_sequences, batch_first=True)
                 label = torch.tensor(
                     [sample[0] - 1 for sample in batch], dtype=torch.int64
                 )
 
-                input = input.to("cuda")
-                label = label.to("cuda")
+                if input.shape[1] > arg.max_length:
+                    input = input[:, : arg.max_length]
+
+                input = input.to(device)
+                label = label.to(device)
 
                 if input.size(1) > arg.max_length:
                     input = input[:, : arg.max_length]
@@ -383,6 +458,7 @@ def main(arg):
             acc = cor / tot
             print(f'-- {"test" if arg.final else "validation"} accuracy {acc:.3}')
             tbw.add_scalar("classification/test-loss", float(loss.item()), e)
+            tbw.add_scalar("classification/test-acc", acc, e)
 
 
 if __name__ == "__main__":
@@ -394,7 +470,7 @@ if __name__ == "__main__":
         "--num-epochs",
         dest="num_epochs",
         help="Number of epochs.",
-        default=100,
+        default=200,
         type=int,
     )
 
@@ -453,7 +529,7 @@ if __name__ == "__main__":
         "--vocab-size",
         dest="vocab_size",
         help="Number of words in the vocabulary.",
-        default=438730,
+        default=50000,
         type=int,
     )
 

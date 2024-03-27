@@ -1,17 +1,9 @@
-from datasets import load_dataset
 from torch import nn
 from torch.nn import functional as F
 import torch
-
-from torch.autograd import Variable
-import numpy as np
-
 from argparse import ArgumentParser
 from torch.utils.tensorboard import SummaryWriter
-from torch.nn.utils.rnn import pad_sequence
-import torchdata
-from torchtext.datasets import IMDB
-import random, tqdm, sys, math, gzip
+import tqdm, math
 
 
 def mask_(matrices, maskval=0.0, mask_diagonal=True):
@@ -236,7 +228,7 @@ class CTransformer(nn.Module):
         self.num_tokens, self.max_pool = num_tokens, max_pool
         self.value_embedding = nn.Linear(1, emb, dtype=torch.double)
         # self.pos_embedding = nn.Embedding(embedding_dim=emb, num_embeddings=seq_length)
-        self.pos_encoding = PositionalEncoding(emb, max_len=seq_length)
+        self.pos_encoding = PositionalEncoding(emb, max_len=seq_length, dropout=0.2)
         tblocks = []
         for i in range(depth):
             tblocks.append(
